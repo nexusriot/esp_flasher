@@ -1,0 +1,7 @@
+.idea/
+.venv/
+
+build/
+dist/
+
+esp_flasher-linux-*
