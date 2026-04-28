@@ -1,5 +1,7 @@
 # ESP Flash Backup Tool
 
+
+
 A PyQt6 desktop GUI for backing up and restoring flash images on Espressif
 ESP8266 and ESP32 family chips. Built as a thin, responsive front-end on top
 of the official [`esptool`](https://github.com/espressif/esptool) Python
@@ -170,3 +172,4 @@ Internals at a glance:
 ## License
 
 MIT.
+
