@@ -733,7 +733,13 @@ class EspFlasher(QtWidgets.QMainWindow):
         port = self.selected_port()
         if not port:
             raise RuntimeError("No serial port selected.")
-        argv = ["-m", "esptool"]
+        # When frozen by PyInstaller sys.executable is the app bundle, not a
+        # Python interpreter.  Re-invoke ourselves with the worker sentinel so
+        # main() can dispatch into esptool without launching the GUI again.
+        if getattr(sys, "frozen", False):
+            argv = ["--esptool-worker"]
+        else:
+            argv = ["-m", "esptool"]
         chip = self.selected_chip_flag()
         if chip:
             argv += ["--chip", chip]
@@ -925,6 +931,15 @@ class EspFlasher(QtWidgets.QMainWindow):
 
 
 def main():
+    # When packaged with PyInstaller, sys.executable is the bundled EXE, not
+    # a Python interpreter.  _start() re-invokes the EXE with this sentinel so
+    # we can dispatch into esptool without opening a second GUI window.
+    if sys.argv[1:2] == ["--esptool-worker"]:
+        import esptool
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        esptool.main()
+        return
+
     app = QtWidgets.QApplication(sys.argv)
     win = EspFlasher()
     win.show()
