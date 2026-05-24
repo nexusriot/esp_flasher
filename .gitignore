@@ -3,5 +3,6 @@
 
 build/
 dist/
-
-esp_flasher-linux-*
+*.spec
+__pycache__/
+*.pyc

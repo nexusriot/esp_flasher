@@ -11,12 +11,14 @@ import mmap
 import os
 import re
 import sys
+import tempfile
 
+import esptool
+import serial
+import serial.tools.list_ports
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QProcess
 
-import serial
-import serial.tools.list_ports
 
 
 def list_serial_ports() -> list[tuple[str, str]]:
@@ -509,6 +511,174 @@ class SerialMonitor(QtWidgets.QDialog):
         super().closeEvent(e)
 
 
+PARTITION_TABLE_SIZE = 0xC00
+DEFAULT_PT_OFFSET = 0x8000
+
+_APP_SUBTYPES = {0x00: "factory", 0x20: "test"}
+_DATA_SUBTYPES = {
+    0x00: "ota", 0x01: "phy", 0x02: "nvs", 0x03: "coredump",
+    0x04: "nvs_keys", 0x05: "efuse", 0x06: "undefined",
+    0x80: "esphttpd", 0x81: "fat", 0x82: "spiffs", 0x83: "littlefs",
+}
+
+
+def _type_name(t: int) -> str:
+    return {0x00: "app", 0x01: "data"}.get(t, f"0x{t:02x}")
+
+
+def _subtype_name(t: int, s: int) -> str:
+    if t == 0x00:
+        if 0x10 <= s <= 0x1F:
+            return f"ota_{s - 0x10}"
+        return _APP_SUBTYPES.get(s, f"0x{s:02x}")
+    if t == 0x01:
+        return _DATA_SUBTYPES.get(s, f"0x{s:02x}")
+    return f"0x{s:02x}"
+
+
+def parse_partition_table(data: bytes) -> list[dict]:
+    """Parse an ESP-IDF partition table (the 0xC00 region at 0x8000).
+
+    Each entry is 32 bytes: magic(2) type(1) subtype(1) offset(4) size(4)
+    label(16) flags(4). 0xAA50 = partition, 0xEBEB = MD5 checksum entry
+    (skipped), anything else (0xFFFF / blank) ends the table.
+    """
+    entries: list[dict] = []
+    for i in range(0, min(len(data), PARTITION_TABLE_SIZE), 32):
+        chunk = data[i:i + 32]
+        if len(chunk) < 32:
+            break
+        magic = chunk[0:2]
+        if magic == b"\xeb\xeb":  # MD5 checksum entry
+            continue
+        if magic != b"\xaa\x50":  # 0xFFFF blank / end of table
+            break
+        ptype = chunk[2]
+        psub = chunk[3]
+        offset = int.from_bytes(chunk[4:8], "little")
+        size = int.from_bytes(chunk[8:12], "little")
+        label = chunk[12:28].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        flags = int.from_bytes(chunk[28:32], "little")
+        entries.append({
+            "label": label, "type": ptype, "subtype": psub,
+            "offset": offset, "size": size, "flags": flags,
+        })
+    return entries
+
+
+class PartitionTableDialog(QtWidgets.QDialog):
+    COLUMNS = ("Label", "Type", "SubType", "Offset", "Size", "Flags")
+
+    def __init__(self, parent: "EspFlasher"):
+        super().__init__(parent)
+        self._owner = parent
+        self.setWindowTitle("Partition Table")
+        self.resize(760, 440)
+        self.entries: list[dict] = []
+
+        v = QtWidgets.QVBoxLayout(self)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.addWidget(QtWidgets.QLabel("Table offset:"))
+        self.offset_edit = QtWidgets.QLineEdit(hex(DEFAULT_PT_OFFSET))
+        self.offset_edit.setMaximumWidth(100)
+        bar.addWidget(self.offset_edit)
+        self.read_btn = QtWidgets.QPushButton("Read from device")
+        self.read_btn.clicked.connect(self._read_device)
+        bar.addWidget(self.read_btn)
+        self.open_btn = QtWidgets.QPushButton("Open file…")
+        self.open_btn.clicked.connect(self._open_file)
+        bar.addWidget(self.open_btn)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table, 1)
+
+        bottom = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("No table loaded.")
+        bottom.addWidget(self.status, 1)
+        self.dump_btn = QtWidgets.QPushButton("Dump selected partition…")
+        self.dump_btn.clicked.connect(self._dump_selected)
+        bottom.addWidget(self.dump_btn)
+        v.addLayout(bottom)
+
+    def _pt_offset(self) -> int:
+        try:
+            return int(self.offset_edit.text().strip(), 0)
+        except ValueError:
+            return DEFAULT_PT_OFFSET
+
+    def _read_device(self):
+        self._owner.read_partition_table(self, self._pt_offset())
+
+    def _open_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open flash image or partition dump", "",
+            "Binary (*.bin);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "Partition Table", str(e))
+            return
+        off = self._pt_offset()
+        if len(data) > off + 0x20:  # looks like a full flash image
+            data = data[off:off + PARTITION_TABLE_SIZE]
+        self.load_from_bytes(data)
+
+    def load_from_bytes(self, data: bytes):
+        try:
+            self.entries = parse_partition_table(data)
+        except Exception as e:  # noqa: BLE001 - surface any parse failure
+            QtWidgets.QMessageBox.critical(self, "Partition Table",
+                                           f"Parse failed: {e}")
+            return
+        self.table.setRowCount(len(self.entries))
+        for row, e in enumerate(self.entries):
+            cells = (
+                e["label"],
+                _type_name(e["type"]),
+                _subtype_name(e["type"], e["subtype"]),
+                f"0x{e['offset']:06x}",
+                f"0x{e['size']:x} ({e['size'] // 1024} KB)",
+                f"0x{e['flags']:x}",
+            )
+            for col, text in enumerate(cells):
+                self.table.setItem(row, col, QtWidgets.QTableWidgetItem(text))
+        self.table.resizeColumnsToContents()
+        if self.entries:
+            self.status.setText(f"{len(self.entries)} partitions.")
+            self.table.selectRow(0)
+        else:
+            self.status.setText("No valid partition entries found.")
+
+    def _dump_selected(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.entries):
+            QtWidgets.QMessageBox.information(self, "Partition Table",
+                                              "Select a partition first.")
+            return
+        e = self.entries[row]
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Dump partition as",
+            f"{e['label'] or 'partition'}.bin",
+            "Binary (*.bin);;All files (*)")
+        if path:
+            self._owner.dump_region(e["offset"], e["size"], path)
+
+
 class EspFlasher(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -521,10 +691,13 @@ class EspFlasher(QtWidgets.QMainWindow):
         self.detected_flash_bytes: int | None = None
         self._chain_after_detect: tuple[str, ...] | None = None
         self._pending_restore: tuple[int, str] | None = None
+        self._pending_verify: tuple[int, str] | None = None
+        self._pending_parttable: tuple[PartitionTableDialog, str, int] | None = None
 
         self._build_ui()
         self._build_menus()
         self.refresh_ports()
+        self._restore_settings()
 
     def _build_menus(self):
         tools = self.menuBar().addMenu("&Tools")
@@ -536,6 +709,14 @@ class EspFlasher(QtWidgets.QMainWindow):
         hx.setShortcut("Ctrl+H")
         hx.triggered.connect(self._open_hex_viewer)
         tools.addAction(hx)
+        pt = QtGui.QAction("Partition Table…", self)
+        pt.setShortcut("Ctrl+P")
+        pt.triggered.connect(self._open_partitions)
+        tools.addAction(pt)
+        tools.addSeparator()
+        er = QtGui.QAction("Erase Flash…", self)
+        er.triggered.connect(self.start_erase)
+        tools.addAction(er)
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -632,10 +813,31 @@ class EspFlasher(QtWidgets.QMainWindow):
         self.erase_chk.setChecked(True)
         r.addWidget(self.erase_chk, 1, 2)
 
+        self.verify_chk = QtWidgets.QCheckBox("Verify after write")
+        self.verify_chk.setChecked(True)
+        r.addWidget(self.verify_chk, 2, 2)
+
         self.restore_btn = QtWidgets.QPushButton("Restore Flash")
         self.restore_btn.clicked.connect(self.start_restore)
-        r.addWidget(self.restore_btn, 2, 0, 1, 3)
+        r.addWidget(self.restore_btn, 3, 0, 1, 2)
+        self.verify_btn = QtWidgets.QPushButton("Verify Only")
+        self.verify_btn.setToolTip(
+            "Compare the firmware file against flash without writing")
+        self.verify_btn.clicked.connect(self.start_verify)
+        r.addWidget(self.verify_btn, 3, 2)
         root.addWidget(restore)
+
+        maint = QtWidgets.QGroupBox("Flash maintenance")
+        m = QtWidgets.QHBoxLayout(maint)
+        self.erase_btn = QtWidgets.QPushButton("Erase Flash")
+        self.erase_btn.setToolTip("Erase the entire chip (destructive)")
+        self.erase_btn.clicked.connect(self.start_erase)
+        m.addWidget(self.erase_btn)
+        self.part_btn = QtWidgets.QPushButton("Partition Table…")
+        self.part_btn.clicked.connect(self._open_partitions)
+        m.addWidget(self.part_btn)
+        m.addStretch(1)
+        root.addWidget(maint)
 
         # --- Progress + cancel ---
         prow = QtWidgets.QHBoxLayout()
@@ -804,12 +1006,75 @@ class EspFlasher(QtWidgets.QMainWindow):
         addr = self._parse_addr(self.backup_addr.text(), default=0)
         if addr is None:
             self._error("Invalid start address."); return
+        self._read_flash_to(addr, size_bytes, out, op="backup")
+
+    def _read_flash_to(self, addr: int, size: int, out: str,
+                       op: str = "backup") -> bool:
         try:
-            argv = self._esptool_argv("read_flash", hex(addr), str(size_bytes), out)
+            argv = self._esptool_argv("read_flash", hex(addr), str(size), out)
+        except RuntimeError as e:
+            self._error(str(e)); return False
+        self.append_log(f"[{op}] reading {size} bytes from {hex(addr)} → {out}\n")
+        self._start(op, argv)
+        return True
+
+    def start_verify(self):
+        path = self.restore_path.text().strip()
+        if not path or not os.path.isfile(path):
+            self._error("Pick an existing firmware file to verify against."); return
+        addr = self._parse_addr(self.restore_addr.text(), default=0)
+        if addr is None:
+            self._error("Invalid address."); return
+        self._do_verify(addr, path)
+
+    def _do_verify(self, addr: int, path: str):
+        try:
+            argv = self._esptool_argv("verify_flash", hex(addr), path)
         except RuntimeError as e:
             self._error(str(e)); return
-        self.append_log(f"[backup] reading {size_bytes} bytes from {hex(addr)} → {out}\n")
-        self._start("backup", argv)
+        self.append_log(f"[verify] comparing {path} against flash at {hex(addr)}\n")
+        self._start("verify", argv)
+
+    def start_erase(self):
+        if QtWidgets.QMessageBox.question(
+            self, "Erase Flash",
+            "Erase the ENTIRE flash chip?\n\nThis wipes all firmware and "
+            "data and cannot be undone.",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        ) != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            argv = self._esptool_argv("erase_flash")
+        except RuntimeError as e:
+            self._error(str(e)); return
+        self.append_log("[erase] erasing entire flash…\n")
+        self._start("erase", argv)
+
+    def _open_partitions(self):
+        dlg = PartitionTableDialog(self)
+        dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+
+    def read_partition_table(self, dialog: "PartitionTableDialog", offset: int):
+        if self.process is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Busy", "An operation is already running.")
+            return
+        fd, tmp = tempfile.mkstemp(suffix=".bin", prefix="esp_pt_")
+        os.close(fd)
+        if self._read_flash_to(offset, PARTITION_TABLE_SIZE, tmp, op="parttable"):
+            self._pending_parttable = (dialog, tmp, offset)
+            dialog.read_btn.setEnabled(False)
+        else:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def dump_region(self, addr: int, size: int, out: str):
+        self._read_flash_to(addr, size, out, op="backup")
 
     def start_restore(self):
         path = self.restore_path.text().strip()
@@ -818,6 +1083,7 @@ class EspFlasher(QtWidgets.QMainWindow):
         addr = self._parse_addr(self.restore_addr.text(), default=0)
         if addr is None:
             self._error("Invalid address."); return
+        self._pending_verify = (addr, path) if self.verify_chk.isChecked() else None
         if self.erase_chk.isChecked():
             self._pending_restore = (addr, path)
             try:
@@ -894,11 +1160,45 @@ class EspFlasher(QtWidgets.QMainWindow):
                 addr, path = self._pending_restore
                 self._pending_restore = None
                 self._do_restore(addr, path)
+            elif op == "restore" and self._pending_verify:
+                addr, path = self._pending_verify
+                self._pending_verify = None
+                self._do_verify(addr, path)
+            elif op == "parttable" and self._pending_parttable:
+                self._finish_parttable(success=True)
         else:
             self.append_log(f"[{op}] FAILED (exit {exit_code}).\n")
             self.statusBar().showMessage(f"{op}: failed", 5000)
+            if op == "parttable":
+                self._finish_parttable(success=False)
             self._chain_after_detect = None
             self._pending_restore = None
+            self._pending_verify = None
+
+    def _finish_parttable(self, success: bool):
+        if not self._pending_parttable:
+            return
+        dialog, tmp, offset = self._pending_parttable
+        self._pending_parttable = None
+        try:
+            data = b""
+            if success:
+                with open(tmp, "rb") as fh:
+                    data = fh.read()
+            # Dialog may have been closed (WA_DeleteOnClose) mid-read.
+            try:
+                if success:
+                    dialog.load_from_bytes(data)
+                else:
+                    dialog.status.setText("Read from device failed (see log).")
+                dialog.read_btn.setEnabled(True)
+            except RuntimeError:
+                pass  # dialog already destroyed
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _on_error(self, _err):
         msg = self.process.errorString() if self.process else "process error"
@@ -911,6 +1211,7 @@ class EspFlasher(QtWidgets.QMainWindow):
 
     def set_running(self, running: bool):
         for w in (self.detect_btn, self.backup_btn, self.restore_btn,
+                  self.verify_btn, self.erase_btn, self.part_btn,
                   self.refresh_btn, self.port_combo, self.baud_combo,
                   self.chip_override, self.monitor_btn):
             w.setEnabled(not running)
@@ -929,18 +1230,67 @@ class EspFlasher(QtWidgets.QMainWindow):
         except ValueError:
             return None
 
+    def _restore_settings(self):
+        s = QtCore.QSettings()
+        geo = s.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+        port = s.value("port", "", type=str)
+        if port:
+            for i in range(self.port_combo.count()):
+                if self.port_combo.itemData(i) == port:
+                    self.port_combo.setCurrentIndex(i)
+                    break
+            else:
+                self.port_combo.setEditText(port)
+
+        self.baud_combo.setCurrentText(s.value("baud", DEFAULT_BAUD, type=str))
+        self.chip_override.setCurrentIndex(
+            min(s.value("chip_idx", 0, type=int), self.chip_override.count() - 1))
+
+        self.backup_path.setText(s.value("backup_path", "", type=str))
+        self.backup_addr.setText(s.value("backup_addr", "0x0", type=str))
+        self.backup_size_combo.setCurrentIndex(
+            min(s.value("backup_size_idx", 0, type=int),
+                self.backup_size_combo.count() - 1))
+
+        self.restore_path.setText(s.value("restore_path", "", type=str))
+        self.restore_addr.setText(s.value("restore_addr", "0x0", type=str))
+        self.erase_chk.setChecked(s.value("erase_first", True, type=bool))
+        self.verify_chk.setChecked(s.value("verify_after", True, type=bool))
+
+    def _save_settings(self):
+        s = QtCore.QSettings()
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("port", self.selected_port() or "")
+        s.setValue("baud", self.baud_combo.currentText())
+        s.setValue("chip_idx", self.chip_override.currentIndex())
+        s.setValue("backup_path", self.backup_path.text())
+        s.setValue("backup_addr", self.backup_addr.text())
+        s.setValue("backup_size_idx", self.backup_size_combo.currentIndex())
+        s.setValue("restore_path", self.restore_path.text())
+        s.setValue("restore_addr", self.restore_addr.text())
+        s.setValue("erase_first", self.erase_chk.isChecked())
+        s.setValue("verify_after", self.verify_chk.isChecked())
+
+    def closeEvent(self, e):
+        self._save_settings()
+        super().closeEvent(e)
+
 
 def main():
     # When packaged with PyInstaller, sys.executable is the bundled EXE, not
     # a Python interpreter.  _start() re-invokes the EXE with this sentinel so
     # we can dispatch into esptool without opening a second GUI window.
     if sys.argv[1:2] == ["--esptool-worker"]:
-        import esptool
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         esptool.main()
         return
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setOrganizationName("EspFlasher")
+    app.setApplicationName("EspFlasher")
     win = EspFlasher()
     win.show()
     sys.exit(app.exec())
