@@ -27,6 +27,12 @@
   confirms, and warns when a write is in flight.
 - **The Tools menu was not gated during operations**, so Ctrl+M could open a
   serial monitor and steal the port mid-flash.
+- **`make build-*` used the distro python**, which is externally managed
+  (PEP 668) and so can never hold PyInstaller or PyQt6 — the build died on
+  build.py's import guard, and the message it printed (`pip install -r …`)
+  could not work either. The Makefile now uses `.venv` when it exists,
+  `make deps` creates it, and build.py names the interpreter that is missing
+  PyInstaller.
 - A failed `QProcess` start left the UI disabled forever, because
   `finished()` is never emitted in that case.
 
@@ -58,7 +64,7 @@
 - Serial monitor: ANSI colour rendering, regex filter and highlight, panic
   backtrace decoding via `addr2line`, *Reset → Bootloader*, auto-reconnect
   after an unplug, and automatic port hand-off around esptool operations.
-- Test suite (216 tests, `pytest`) and CI. Qt runs on the `offscreen`
+- Test suite (220 tests, `pytest`) and CI. Qt runs on the `offscreen`
   platform and `QSettings` is redirected to a temporary directory. Five of
   them pin `APP_VERSION` against the `Makefile` default, the leading
   `CHANGELOG.md` heading and the README's `.deb` names, because those had

@@ -234,7 +234,7 @@ make deps-dev
 make test
 ```
 
-216 tests: the pure helpers (output scanning for both esptool dialects,
+220 tests: the pure helpers (output scanning for both esptool dialects,
 partition parsing, `flash_args`, manifests, trimming, eFuse and backtrace
 parsing, ANSI segmentation, byte search) plus widget-level tests that drive
 the real windows on Qt's `offscreen` platform. Qt settings are redirected to a

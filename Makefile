@@ -13,7 +13,14 @@
 
 APP        := esp_flasher
 VERSION    ?= 0.3.0
-PY         ?= python3
+# Dependencies live in a project venv: the distro python is externally managed
+# (PEP 668) and refuses `pip install`. Every target below uses the venv once
+# `make deps` has created it; set PY= to build against another interpreter.
+VENV       := .venv
+BOOTSTRAP_PY ?= python3
+PY         ?= $(shell for p in $(VENV)/bin/python $(VENV)/Scripts/python.exe; do \
+                        [ -x "$$p" ] && echo "$$p" && exit; \
+                      done; echo $(BOOTSTRAP_PY))
 HOST_OS    := $(shell uname -s)
 HOST_ARCH  := $(shell uname -m)
 DIST       := dist
@@ -23,8 +30,9 @@ PACKAGING  := packaging
 
 .PHONY: help
 help:
-	@echo "esp_flasher build targets (VERSION=$(VERSION)):"
-	@echo "  make deps                  install PyInstaller + runtime deps"
+	@echo "esp_flasher build targets (VERSION=$(VERSION), PY=$(PY)):"
+	@echo "  make venv                  create $(VENV) if it is missing"
+	@echo "  make deps                  install PyInstaller + runtime deps into $(VENV)"
 	@echo "  make deps-dev              install the test dependencies"
 	@echo "  make icon                  regenerate packaging/esp-flasher.png from the SVG"
 	@echo "  make test                  run the test suite (headless Qt)"
@@ -36,12 +44,19 @@ help:
 	@echo "  make all-linux             build + deb for the current Linux arch"
 	@echo "  make clean"
 
+# Creating the venv and installing into it must be separate targets: make
+# expands a whole recipe before running its first line, so $(PY) would still
+# resolve to the bootstrap interpreter if both lived in one recipe.
+.PHONY: venv
+venv:
+	@[ -x $(PY) ] || { echo "creating $(VENV)"; $(BOOTSTRAP_PY) -m venv $(VENV); }
+
 .PHONY: deps
-deps:
+deps: venv
 	$(PY) -m pip install -r requirements.txt -r requirements-build.txt
 
 .PHONY: deps-dev
-deps-dev:
+deps-dev: venv
 	$(PY) -m pip install -r requirements.txt -r requirements-dev.txt
 
 # The PNG is a tracked asset (build.py and build-deb.sh consume it and neither

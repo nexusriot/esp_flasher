@@ -3,6 +3,8 @@
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -585,3 +587,51 @@ class TestVersionConsistency:
             assert m, f"{name} no longer quotes a test count"
             assert int(m.group(1)) == total, (
                 f"{name} says {m.group(1)} tests, suite collects {total}")
+
+
+class TestBuildInterpreter:
+    """`make build-*` has to run build.py with the project venv.
+
+    The distro python is externally managed (PEP 668), so it has neither
+    PyInstaller nor PyQt6 and cannot be given them; a bare `python3` died on
+    build.py's import guard. The Makefile is exercised with `-n`, which
+    expands the recipes without running them, so these stay host-independent.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _make(self, cwd, *targets):
+        make = shutil.which("make")
+        if make is None:
+            pytest.skip("make is not installed")
+        shutil.copy(os.path.join(self.ROOT, "Makefile"), os.path.join(cwd, "Makefile"))
+        proc = subprocess.run([make, "-n", *targets], cwd=cwd,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    def _fake_venv(self, root):
+        python = os.path.join(root, ".venv", "bin", "python")
+        os.makedirs(os.path.dirname(python))
+        with open(python, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(python, 0o755)
+
+    def test_build_uses_the_venv_when_there_is_one(self, tmp_path):
+        self._fake_venv(str(tmp_path))
+        out = self._make(str(tmp_path), "build-linux-amd64")
+        assert ".venv/bin/python build.py" in out
+
+    def test_build_falls_back_to_python3_without_a_venv(self, tmp_path):
+        out = self._make(str(tmp_path), "build-linux-amd64")
+        assert "python3 build.py" in out
+
+    def test_deps_creates_the_venv_before_installing(self, tmp_path):
+        out = self._make(str(tmp_path), "deps")
+        assert "-m venv .venv" in out
+        assert out.index("-m venv") < out.index("pip install"), out
+
+    def test_py_override_wins(self, tmp_path):
+        self._fake_venv(str(tmp_path))
+        out = self._make(str(tmp_path), "PY=/usr/bin/python3", "build-linux-amd64")
+        assert "/usr/bin/python3 build.py" in out

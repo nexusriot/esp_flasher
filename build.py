@@ -78,9 +78,18 @@ def main() -> int:
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
+        # Distro pythons are externally managed (PEP 668) and refuse to install
+        # into themselves, so point at the venv the Makefile builds with.
+        venv_py = ROOT / ".venv" / "bin" / "python"
         print(
-            "error: PyInstaller is not installed. Run:\n"
-            "  pip install -r requirements.txt -r requirements-build.txt",
+            f"error: PyInstaller is not installed for {sys.executable}.\n"
+            "Build through the Makefile, which uses the project venv:\n"
+            "  make deps && make build-linux-amd64\n"
+            "or set one up by hand:\n"
+            f"  python3 -m venv {ROOT / '.venv'}\n"
+            f"  {venv_py} -m pip install -r requirements.txt "
+            "-r requirements-build.txt\n"
+            f"  {venv_py} build.py --name ...",
             file=sys.stderr,
         )
         return 1
