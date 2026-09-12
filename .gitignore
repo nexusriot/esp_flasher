@@ -1,8 +1,29 @@
 .idea/
+.vscode/
 .venv/
+venv/
+.DS_Store
 
 build/
 dist/
 *.spec
 __pycache__/
 *.pyc
+.pytest_cache/
+*.deb
+
+# Output the tool itself writes, which lands in the working directory when it
+# is run from a checkout: flash dumps and their .json manifests, partition
+# dumps, merged images, the serial log and the partition-table CSV export.
+# A flash image is device-specific and can hold WiFi credentials and keys —
+# it must never be committed.
+*.bin
+*.bin.json
+*.uf2
+*.hex
+*.log
+*.csv
+
+# NOT ignored on purpose: packaging/esp-flasher.png. It is generated from
+# esp-flasher.svg (`make icon`) but is tracked, because build.py and
+# build-deb.sh need it and neither regenerates it.

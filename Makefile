@@ -12,7 +12,7 @@
 #   make clean
 
 APP        := esp_flasher
-VERSION    ?= 0.1.0
+VERSION    ?= 0.3.0
 PY         ?= python3
 HOST_OS    := $(shell uname -s)
 HOST_ARCH  := $(shell uname -m)
@@ -25,6 +25,9 @@ PACKAGING  := packaging
 help:
 	@echo "esp_flasher build targets (VERSION=$(VERSION)):"
 	@echo "  make deps                  install PyInstaller + runtime deps"
+	@echo "  make deps-dev              install the test dependencies"
+	@echo "  make icon                  regenerate packaging/esp-flasher.png from the SVG"
+	@echo "  make test                  run the test suite (headless Qt)"
 	@echo "  make build-linux-amd64     binary -> $(DIST)/$(APP)-linux-amd64      (needs x86_64 Linux)"
 	@echo "  make build-linux-uconsole  binary -> $(DIST)/$(APP)-linux-uconsole   (needs aarch64 Linux)"
 	@echo "  make build-windows         binary -> $(DIST)/$(APP)-windows-amd64.exe (needs Windows)"
@@ -36,6 +39,29 @@ help:
 .PHONY: deps
 deps:
 	$(PY) -m pip install -r requirements.txt -r requirements-build.txt
+
+.PHONY: deps-dev
+deps-dev:
+	$(PY) -m pip install -r requirements.txt -r requirements-dev.txt
+
+# The PNG is a tracked asset (build.py and build-deb.sh consume it and neither
+# builds it), so this only needs running when the SVG changes.
+.PHONY: icon
+icon:
+	QT_QPA_PLATFORM=offscreen $(PY) -c "\
+from PyQt6 import QtGui, QtCore, QtWidgets, QtSvg; \
+app = QtWidgets.QApplication([]); \
+r = QtSvg.QSvgRenderer('$(PACKAGING)/esp-flasher.svg'); \
+img = QtGui.QImage(256, 256, QtGui.QImage.Format.Format_ARGB32); \
+img.fill(QtCore.Qt.GlobalColor.transparent); \
+pn = QtGui.QPainter(img); r.render(pn); pn.end(); \
+img.save('$(PACKAGING)/esp-flasher.png') or exit('save failed')"
+	@echo "wrote $(PACKAGING)/esp-flasher.png"
+
+# Qt needs a platform plugin; offscreen keeps the suite runnable over ssh.
+.PHONY: test
+test:
+	QT_QPA_PLATFORM=offscreen NO_COLOR=1 $(PY) -m pytest
 
 .PHONY: build-linux-amd64
 build-linux-amd64:
@@ -72,4 +98,5 @@ all-linux:
 
 .PHONY: clean
 clean:
-	rm -rf build $(DIST) $(APP)-*.spec __pycache__
+	rm -rf build $(DIST) $(APP)-*.spec __pycache__ .pytest_cache \
+	       tests/__pycache__

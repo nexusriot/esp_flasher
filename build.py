@@ -8,6 +8,7 @@ single-file mode by default, or a directory bundle with --onedir.
     python build.py --onedir        # one-folder build (faster startup)
     python build.py --debug         # keep console attached for tracebacks
     python build.py --clean         # nuke build/ dist/ *.spec first
+    python build.py --name NAME     # override the artifact name (see Makefile)
 """
 
 from __future__ import annotations
@@ -104,11 +105,26 @@ def main() -> int:
         # backends. --collect-all pulls submodules + data + binaries.
         "--collect-all", "esptool",
         "--collect-all", "serial",
+        # espefuse backs the Chip Security panel and is re-invoked through the
+        # --espefuse-worker sentinel, so the analyser never sees the import.
+        "--collect-all", "espefuse",
+        # espefuse -> bitstring, which picks its backend at import time
+        # (bitstring.bitstore_bitarray); without these the eFuse panel dies
+        # with ModuleNotFoundError while everything else works.
+        "--collect-all", "bitstring",
+        "--collect-all", "bitarray",
         "--onedir" if args.onedir else "--onefile",
     ]
+    icon = ROOT / "packaging" / "esp-flasher.png"
+    if icon.exists():
+        argv += ["--icon", str(icon)]
     if not args.debug:
         # macOS: produces a .app bundle. Windows: hides console window.
         # Linux: no-op (no console attached for GUI launches anyway).
+        #
+        # NOTE --windowed also detaches stdout on Windows/macOS, which the
+        # headless subcommands need; build with --debug for a CLI-capable
+        # binary on those platforms.
         argv.append("--windowed")
     argv.append(str(ENTRY))
 
